@@ -13,7 +13,7 @@
 #include "message.h"
 #include <signal.h>
 
-#define SERVER_IP "132.72.50.204"
+#define SERVER_IP "192.5.1.1"
 #define SERVER_PORT 9080
 
 #define MULTICAST_IP "239.0.0.1"
@@ -29,7 +29,7 @@
 
 int server_sock = -1;
 int multicast_sock = -1;
-int tcp_server_sock = -1;
+int server_side_sock = -1;
 char file_storage[MAX_FILES][FILE_CONTENT_SIZE];
 ClientInfo clients[MAX_CLIENTS];
 int client_count = 0;
@@ -38,11 +38,38 @@ int my_id = -1;
 char my_token[TOKEN_SIZE] = "TOKEN-NONE"; // Default token
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t token_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t pending_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+PendingRequest pending_request;
+
+
 struct sockaddr_in multicast_addr;
 
 
 void sigint_handler(int signum) {
-    printf("\nCaught SIGINT, cleaning up...\n");
+    printf("\nCaught SIGINT, notifying others and cleaning up...\n");
+
+    // Prepare MSG_CLIENT_OFF with token
+    Message off_msg;
+    memset(&off_msg, 0, sizeof(off_msg));
+    off_msg.type = MSG_CLIENT_OFF;
+    off_msg.sender_id = my_id;
+
+    pthread_mutex_lock(&token_mutex);
+    strncpy(off_msg.token, my_token, TOKEN_SIZE);
+    pthread_mutex_unlock(&token_mutex);
+
+    // 1. Send to all connected clients via TCP
+    pthread_mutex_lock(&clients_mutex);
+    for (int i = 0; i < client_count; ++i) {
+        send(clients[i].tcp_sock, &off_msg, sizeof(off_msg), 0);
+    }
+    pthread_mutex_unlock(&clients_mutex);
+
+    // 2. Send to server via TCP
+    if (server_sock >= 0) {
+        send(server_sock, &off_msg, sizeof(off_msg), 0);
+    }
 
     if (server_sock >= 0) {
         close(server_sock);
@@ -60,9 +87,9 @@ void sigint_handler(int signum) {
         multicast_sock = -1;
     }
 
-    if (tcp_server_sock >= 0) {
-        close(tcp_server_sock);
-        tcp_server_sock = -1;
+    if (server_side_sock >= 0) {
+        close(server_side_sock);
+        server_side_sock = -1;
     }
 
     // Close all client sockets
@@ -89,6 +116,7 @@ void add_client(int sock, struct sockaddr_in *addr, int sender_id) {
 
     if (client_count < MAX_CLIENTS) {
         clients[client_count].tcp_sock = sock;
+
         clients[client_count].addr = *addr;
         clients[client_count].last_ack = time(NULL);
         clients[client_count].sender_id = sender_id;
@@ -111,8 +139,8 @@ int connect_to_server() {
     }
 
     struct sockaddr_in server_addr = {
-            .sin_family = AF_INET,
-            .sin_port = htons(SERVER_PORT)
+        .sin_family = AF_INET,
+        .sin_port = htons(SERVER_PORT)
     };
     inet_pton(AF_INET, SERVER_IP, &server_addr.sin_addr);
 
@@ -137,48 +165,51 @@ int connect_to_server() {
 }
 
 
-// Join multicast group and create UDP socket
-int setup_multicast() {
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        perror("multicast socket");
-        return -1;
-    }
+// Creates and sets up a multicast socket. Returns the socket descriptor or -1 on failure.
+int setup_multicast_socket(const char* mcast_ip, uint16_t mcast_port, const char* iface_ip) {
 
-    int reuse = 1;
-    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
-        perror("setsockopt reuseaddr");
-        close(sock);
-        return -1;
-    }
+	int sock;
+	struct sockaddr_in mcast_addr;
+	struct ip_mreq mreq;
+	int reuse = 1;
 
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(MULTICAST_PORT);
-    addr.sin_addr.s_addr = INADDR_ANY;
+	// 1. Create the UDP socket
+	sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sock < 0) {
+		perror("socket creation failed");
+		return -1;
+	}
 
-    if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("bind multicast");
-        close(sock);
-        return -1;
-    }
+	// 2. Allow address reuse
+	if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+		perror("setsockopt SO_REUSEADDR failed");
+		close(sock);
+		return -1;
+	}
 
-    struct ip_mreq mreq;
-    mreq.imr_multiaddr.s_addr = inet_addr(MULTICAST_IP);
-    mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+	// 3. Bind the socket to the multicast port on all interfaces
+	memset(&mcast_addr, 0, sizeof(mcast_addr));
+	mcast_addr.sin_family = AF_INET;
+	mcast_addr.sin_port = htons(mcast_port);
+	mcast_addr.sin_addr.s_addr = htonl(INADDR_ANY); // Receive on all interfaces
 
-    if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
-        perror("setsockopt multicast join");
-        close(sock);
-        return -1;
-    }
+	if (bind(sock, (struct sockaddr*)&mcast_addr, sizeof(mcast_addr)) < 0) {
+		perror("bind failed");
+		close(sock);
+		return -1;
+	}
 
-    // Set global multicast address for sending
-    multicast_addr.sin_family = AF_INET;
-    multicast_addr.sin_addr.s_addr = inet_addr(MULTICAST_IP);
-    multicast_addr.sin_port = htons(MULTICAST_PORT);
+	// 4. Join the multicast group on the given interface
+	mreq.imr_multiaddr.s_addr = inet_addr(mcast_ip); // Multicast group
+	mreq.imr_interface.s_addr = inet_addr(iface_ip); // Interface to join on
 
-    return sock;
+	if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+		perror("setsockopt IP_ADD_MEMBERSHIP failed");
+		close(sock);
+		return -1;
+	}
+
+	return sock; // Success
 }
 
 // Set up the TCP server to listen for incoming connections
@@ -190,9 +221,9 @@ int setup_tcp_server(int port) {
     }
 
     struct sockaddr_in server_addr = {
-            .sin_family = AF_INET,
-            .sin_port = htons(port),
-            .sin_addr.s_addr = INADDR_ANY
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+        .sin_addr.s_addr = INADDR_ANY
     };
 
     if (bind(server_sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
@@ -206,9 +237,12 @@ int setup_tcp_server(int port) {
         close(server_sock);
         return -1;
     }
+   
+   
 
     return server_sock;
 }
+
 
 
 
@@ -260,7 +294,7 @@ void* multicast_thread(void* arg) {
         // Send HELLO
         msg.type = MSG_HELLO;
         msg.sender_id = my_id;
-        msg.port = 9050;
+        msg.port = 5000;
         sendto(multicast_sock, &msg, sizeof(msg), 0,
                (struct sockaddr*)&multicast_addr, sizeof(multicast_addr));
 
@@ -289,12 +323,13 @@ void* multicast_thread(void* arg) {
                         known_client_ids[known_client_count++] = msg.sender_id;
                         sender_addr.sin_port = htons(msg.port);
 
-                        int sock = socket(AF_INET, SOCK_STREAM, 0);
-                        if (connect(sock, (struct sockaddr*)&sender_addr, sizeof(sender_addr)) == 0) {
-                            add_client(sock, &sender_addr, msg.sender_id);
-                        } else {
-                            close(sock);
-                        }
+                        int sock = connect_to_client(&sender_addr);
+			if (sock >= 0) {
+			    add_client(sock, &sender_addr, msg.sender_id);
+			} else {
+			    // Connection failed; already handled inside connect_to_client
+			}
+
                     }
                 }
             }
@@ -318,6 +353,8 @@ void* tcp_handler(void* arg) {
             printf("DEBUG: Connection closed or error on socket %d\n", sock);
             break;
         }
+        
+        
 
 
         if (msg.type == MSG_KEEP_ALIVE) {
@@ -335,38 +372,123 @@ void* tcp_handler(void* arg) {
             }
             pthread_mutex_unlock(&clients_mutex);
         }
-
         else if (msg.type == MSG_DATA_REQUEST) {
             int requested_index = atoi(msg.payload);
             Message response;
             memset(&response, 0, sizeof(response));
             response.sender_id = my_id;
+            
+            int peer_sock = -1;
+	pthread_mutex_lock(&clients_mutex);
+	for (int i = 0; i < client_count; ++i) {
+	    if (clients[i].sender_id == msg.sender_id) {
+		peer_sock = clients[i].tcp_sock;
+		break;
+	    }
+	}
+	pthread_mutex_unlock(&clients_mutex);
 
-            if (strlen(file_storage[requested_index]) > 0) {
+	if (peer_sock >= 0) {
+	    send(peer_sock, &response, sizeof(response), 0);
+	} else {
+	    printf("DEBUG: Could not find socket for client ID %d\n", msg.sender_id);
+	}
+
+            if (requested_index >= 0 && requested_index < MAX_FILES && strlen(file_storage[requested_index]) > 0) {
                 response.type = MSG_DATA_RESPONSE;
-                strncpy(response.payload, file_storage[requested_index], sizeof(response.payload) - 1);
-                send(sock, &response, sizeof(response), 0);
+                int max_content_len = sizeof(response.payload) - 12;
+                snprintf(response.payload, sizeof(response.payload), "%d:%.*s",
+                         requested_index, max_content_len, file_storage[requested_index]);
+
+                pthread_mutex_lock(&token_mutex);
+                strncpy(response.token, my_token, TOKEN_SIZE);
+                pthread_mutex_unlock(&token_mutex);
+
+                send(peer_sock, &response, sizeof(response), 0);
+
                 printf("[Client] Sent file %d to peer.\n", requested_index);
             } else {
                 response.type = MSG_DATA_NOT_FOUND;
                 snprintf(response.payload, sizeof(response.payload), "NO");
-                send(sock, &response, sizeof(response), 0);
-                printf("[Client] I don't have file %d. Sent NO.\n", requested_index);
+
+                pthread_mutex_lock(&token_mutex);
+                strncpy(response.token, my_token, TOKEN_SIZE);
+                pthread_mutex_unlock(&token_mutex);
+
+                send(peer_sock, &response, sizeof(response), 0);
+
+                printf("[Client] I don't have file %d. Sent NO.\n", sock);
             }
         }
-
         else if (msg.type == MSG_TOKEN) {
             strncpy(my_token, msg.token, TOKEN_SIZE);
-            my_token[TOKEN_SIZE - 1] = '\0';  // Ensure null-termination
+            my_token[TOKEN_SIZE - 1] = '\0';
             printf("DEBUG: Updated my token: '%s'\n", my_token);
         }
-
-        else if (msg.type == MSG_DATA_RESPONSE) {
-
-            continue;
-
+        else if (msg.type == MSG_SERVER_OFF) {
+            printf("DEBUG: Received MSG_SERVER_OFF from server. Shutting down.\n");
+            raise(SIGINT);
+            break;
         }
+        else if (msg.type == MSG_CLIENT_OFF) {
+            printf("DEBUG: Received MSG_CLIENT_OFF from client ID %d. Validating token...\n", msg.sender_id);
+            pthread_mutex_lock(&token_mutex);
+            int token_valid = strncmp(msg.token, my_token, TOKEN_SIZE) == 0;
+            pthread_mutex_unlock(&token_mutex);
 
+            if (!token_valid) {
+                printf("WARNING: Received MSG_CLIENT_OFF with invalid token. Ignoring.\n");
+                continue;
+            }
+
+            pthread_mutex_lock(&clients_mutex);
+            for (int i = 0; i < client_count; ++i) {
+                if (clients[i].sender_id == msg.sender_id) {
+                    printf("Client ID %d is disconnecting (token valid). Removing from list.\n", msg.sender_id);
+                    close(clients[i].tcp_sock);
+                    clients[i] = clients[--client_count];
+                    break;
+                }
+            }
+            pthread_mutex_unlock(&clients_mutex);
+        }
+        else if (msg.type == MSG_DATA_RESPONSE || msg.type == MSG_DATA_NOT_FOUND) {
+            pthread_mutex_lock(&pending_mutex);
+
+            int resp_file_index = -1;
+            sscanf(msg.payload, "%d:", &resp_file_index);
+
+            printf("DEBUG: Received response for file %d, pending request file %d, msg type %d\n",
+                   resp_file_index, pending_request.file_index, msg.type);
+
+            if (resp_file_index == pending_request.file_index || msg.type == MSG_DATA_NOT_FOUND) {
+                if (msg.type == MSG_DATA_RESPONSE) {
+                    pthread_mutex_lock(&token_mutex);
+                    if (strncmp(msg.token, my_token, TOKEN_SIZE) == 0) {
+                        char *data_start = strchr(msg.payload, ':');
+                        if (data_start) {
+                            data_start++; // skip ':'
+                            strncpy(pending_request.data, data_start, FILE_CONTENT_SIZE - 1);
+                            pending_request.data[FILE_CONTENT_SIZE - 1] = '\0';
+                            pending_request.received = 1;
+                        } else {
+                            strncpy(pending_request.data, msg.payload, FILE_CONTENT_SIZE - 1);
+                            pending_request.data[FILE_CONTENT_SIZE - 1] = '\0';
+                            pending_request.received = 1;
+                        }
+                    } else {
+                        printf("Invalid token in response. Ignoring.\n");
+                    }
+                    pthread_mutex_unlock(&token_mutex);
+                } else {
+                    // MSG_DATA_NOT_FOUND
+                    printf("NO");
+                    pending_request.received = -1;
+                }
+            }
+
+            pthread_mutex_unlock(&pending_mutex);
+        }
         else {
             printf("DEBUG: Unknown message type received: %d\n", msg.type);
         }
@@ -380,12 +502,10 @@ void* tcp_handler(void* arg) {
 
 
 
-// Thread 3: Request data from known clients, fallback to server
 void* data_request_thread(void* arg) {
     server_sock = *(int*)arg;
     char input[32];
     Message msg;
-    char filename[64];
 
     while (1) {
         printf("\nEnter file index to request from server (or 'q' to quit): \n");
@@ -399,72 +519,62 @@ void* data_request_thread(void* arg) {
         }
 
         int file_index = atoi(input);
-        if (file_index < 0) {
-            printf("Invalid file index. Please enter a positive integer.\n");
+        if (file_index < 0 || file_index >= MAX_FILES) {
+            printf("Invalid file index. Please enter a valid number between 0 and %d.\n", MAX_FILES-1);
             continue;
         }
-        int file_found = 0;  // reset
 
-        // Try known clients first
+        if (strlen(file_storage[file_index]) > 0) {
+            printf("[Client] File %d is already available locally.\n", file_index);
+            printf("%s\n", file_storage[file_index]);
+            continue;  // Skip request
+        }
+
+        int found = 0;
+
         pthread_mutex_lock(&clients_mutex);
         for (int i = 0; i < client_count; i++) {
             int peer_sock = clients[i].tcp_sock;
 
-            // Send request to peer
             memset(&msg, 0, sizeof(msg));
             msg.type = MSG_DATA_REQUEST;
             msg.sender_id = my_id;
             snprintf(msg.payload, sizeof(msg.payload), "%d", file_index);
             send(peer_sock, &msg, sizeof(msg), 0);
 
-            // Wait up to 2 seconds for response using select
-            fd_set read_fds;
-            FD_ZERO(&read_fds);
-            FD_SET(peer_sock, &read_fds);
-            struct timeval timeout = {2, 0};  // 2 seconds
+            pthread_mutex_lock(&pending_mutex);
+            pending_request.file_index = file_index;
+            pending_request.received = 0;
+            pthread_mutex_unlock(&pending_mutex);
 
-            int ready = select(peer_sock + 1, &read_fds, NULL, NULL, &timeout);
-            if (ready > 0) {
-                recv(peer_sock, &msg, sizeof(msg), 0);
 
-                if (msg.type == MSG_DATA_RESPONSE) {
-                    // Save file to memory and disk
-                    printf("Received token: '%s' from client ID %d\n", msg.token, msg.sender_id);
-                    pthread_mutex_lock(&token_mutex);
-                    char expected_token[TOKEN_SIZE];
-                    strncpy(expected_token, my_token, TOKEN_SIZE);
-                    expected_token[TOKEN_SIZE - 1] = '\0';  // Ensure null termination
-                    pthread_mutex_unlock(&token_mutex);
 
-                    if (strncmp(msg.token, expected_token, TOKEN_SIZE) != 0) {
-                        printf("Received file with invalid token from client ID %d\n", msg.sender_id);
-                        continue; // Discard the file
-                    }
-                    strncpy(file_storage[file_index], msg.payload, FILE_CONTENT_SIZE - 1);
-                    file_storage[file_index][FILE_CONTENT_SIZE - 1] = '\0';
-
-                    snprintf(filename, sizeof(filename), "received_file%d.txt", file_index);
-                    FILE *fp = fopen(filename, "w");
-                    if (fp) {
-                        fwrite(msg.payload, 1, strlen(msg.payload), fp);
-                        fclose(fp);
-                    }
-
-                    printf("[Client] Received file from peer %d: %s\n", clients[i].sender_id, filename);
-                    printf("%s\n", file_storage[file_index]);
-                    file_found = 1;
+            // Wait for response with timeout (2 seconds max)
+            int j;
+            for (j = 0; j < 20; j++) {
+                usleep(100000);
+                pthread_mutex_lock(&pending_mutex);
+                if (pending_request.received != 0) {
+                    pthread_mutex_unlock(&pending_mutex);
                     break;
-                } else if (msg.type == MSG_DATA_NOT_FOUND) {
-                    printf("[Client] Peer %d doesn't have the file.\n", clients[i].sender_id);
                 }
-            } else {
-                printf("[Client] Peer %d did not respond.\n", clients[i].sender_id);
+                pthread_mutex_unlock(&pending_mutex);
             }
+
+            pthread_mutex_lock(&pending_mutex);
+            if (pending_request.received == 1) {
+                strncpy(file_storage[file_index], pending_request.data, FILE_CONTENT_SIZE - 1);
+                file_storage[file_index][FILE_CONTENT_SIZE - 1] = '\0';
+                pthread_mutex_unlock(&pending_mutex);
+                printf("[Client] Received file %d from peer %d.\n", file_index, clients[i].sender_id);
+                found = 1;
+                break;
+            }
+            pthread_mutex_unlock(&pending_mutex);
         }
         pthread_mutex_unlock(&clients_mutex);
 
-        // If no peer had the file, ask the server
-        if (!file_found) {
+        if (!found) {
             printf("[Client] No peer had the file. Asking server...\n");
 
             memset(&msg, 0, sizeof(msg));
@@ -473,48 +583,40 @@ void* data_request_thread(void* arg) {
             snprintf(msg.payload, sizeof(msg.payload), "%d", file_index);
             send(server_sock, &msg, sizeof(msg), 0);
 
-            if (recv(server_sock, &msg, sizeof(msg), 0) <= 0) {
-                printf("Failed to receive data from server.\n");
-                continue;
-            }
+            pthread_mutex_lock(&pending_mutex);
+            pending_request.file_index = file_index;
+            pending_request.received = 0;
+            pthread_mutex_unlock(&pending_mutex);
 
-            if (msg.type == MSG_DATA_RESPONSE) {
-                printf("Received token: '%s' from client ID %d\n", msg.token, msg.sender_id);
-                // Save in memory and disk
-                pthread_mutex_lock(&token_mutex);
-                char expected_token[TOKEN_SIZE];
-                strncpy(expected_token, my_token, TOKEN_SIZE);
-                expected_token[TOKEN_SIZE - 1] = '\0';  // Ensure null termination
-                pthread_mutex_unlock(&token_mutex);
-
-                if (strncmp(msg.token, expected_token, TOKEN_SIZE) != 0) {
-                    printf("Received file with invalid token from client ID %d\n", msg.sender_id);
-                    continue; // Discard the file
+            // Wait for server response
+            for (int j = 0; j < 20; j++) {
+                usleep(100000);
+                pthread_mutex_lock(&pending_mutex);
+                if (pending_request.received != 0) {
+                    pthread_mutex_unlock(&pending_mutex);
+                    found = 1;
+                    break;
                 }
-
-
-                strncpy(file_storage[file_index], msg.payload, FILE_CONTENT_SIZE - 1);
-                file_storage[file_index][FILE_CONTENT_SIZE - 1] = '\0';
-
-                snprintf(filename, sizeof(filename), "received_file%d.txt", file_index);
-                FILE *fp = fopen(filename, "w");
-                if (fp) {
-                    fwrite(msg.payload, 1, strlen(msg.payload), fp);
-                    fclose(fp);
-                }
-
-                printf("[Client] Received file from server: %s\n", filename);
-                printf("%s\n", file_storage[file_index]);
-            } else {
-                printf("Server returned unexpected message.\n");
+                pthread_mutex_unlock(&pending_mutex);
             }
         }
+
+        pthread_mutex_lock(&pending_mutex);
+        if (pending_request.received == 1) {
+            strncpy(file_storage[file_index], pending_request.data, FILE_CONTENT_SIZE - 1);
+            file_storage[file_index][FILE_CONTENT_SIZE - 1] = '\0';
+            printf("[Client] Received file: %s\n", file_storage[file_index]);
+        } else {
+            printf("[Client] File not found on peers or server.\n");
+        }
+        pthread_mutex_unlock(&pending_mutex);
     }
 
     return NULL;
 }
 
 
+       
 
 // KEEP ALIVE MODIFICATION: keep-alive thread
 void* keep_alive_thread_func(void* arg) {
@@ -563,12 +665,12 @@ int main() {
     pthread_create(&server_thread, NULL, tcp_handler, create_sock_ptr(server_sock));
 
     // Step 2: Set up multicast socket
-    multicast_sock = setup_multicast();
+    multicast_sock = setup_multicast_socket("239.0.0.1", 12345, "0.0.0.0");
     if (multicast_sock < 0) return 1;
 
     // Step 3: Set up TCP server to listen for incoming connections
-    tcp_server_sock = setup_tcp_server(9050);
-    if (tcp_server_sock < 0) return 1;
+    server_side_sock = setup_tcp_server(5000);
+    if (server_side_sock < 0) return 1;
 
     // Step 4: Start multicast hello and keep-alive threads
     pthread_t hello_thread, keep_alive_thread, data_request_thread_id;
@@ -580,7 +682,8 @@ int main() {
 
     // Step 5: Handle incoming client connections (main thread loop)
     while (1) {
-        int client_sock = accept(tcp_server_sock, NULL, NULL);
+        int client_sock = accept(server_side_sock, NULL, NULL);
+
         if (client_sock < 0) {
             perror("DEBUG: Accept failed");
             continue;
@@ -592,7 +695,7 @@ int main() {
 
     close(server_sock);
     close(multicast_sock);
-    close(tcp_server_sock);
+    close(server_side_sock);
 
     return 0;
 }
